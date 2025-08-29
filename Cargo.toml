@@ -11,4 +11,4 @@ candle-nn = { git = "https://github.com/huggingface/candle.git", version = "0.9"
     "cuda",
 ] }
 anyhow = "1.0"
-itertools = "0.14.0"
+smtlib = { version = "0.3.0" }
