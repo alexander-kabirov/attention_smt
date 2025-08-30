@@ -1,5 +1,5 @@
 ### Prerequisites
-Make sure that z3 binary is installed 
+Make sure that Z3 Theorem Prover binary is installed 
 ### Running the code
 1. Install [Rust](https://www.rust-lang.org/)
 2. Clone the repo
