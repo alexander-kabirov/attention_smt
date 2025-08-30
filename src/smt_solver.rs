@@ -1,10 +1,8 @@
 use anyhow::anyhow;
 use easy_smt::{Context, ContextBuilder, SExpr};
-use smtlib::backend::z3_binary::Z3Binary;
-use smtlib::prelude::*;
-use smtlib::terms::Const;
-use smtlib::{Real, Solver, Storage};
 
+// Generates n Real variables and adds them to the context, we also enforce them to be boolean (0.0 or 1.0)
+// If non_zero is true, we enforce at least one variable to be non-zero
 fn generate_variables(
     n: usize,
     mut ctx: Context,
@@ -38,8 +36,7 @@ fn generate_variables(
     Ok((vars, ctx))
 }
 
-// Outputs the linear constraints as consts
-// The output size is weight_rows x var_cols
+// Outputs the linear transformation constraints as consts
 fn generate_linear_constraints(
     weights: Vec<Vec<f64>>,
     weight_rows: usize,
@@ -81,20 +78,34 @@ fn generate_linear_constraints(
 }
 
 fn generate_relu_constraints<'a>(
-    input_vars: &'a Vec<Const<Real<'a>>>,
-    st: &'a Storage,
-    mut solver: Solver<'a, Z3Binary>,
-) -> anyhow::Result<Solver<'a, Z3Binary>> {
-    let dim = input_vars.len();
-    let pos_relu_axiom = Real::new_const(st, "pos_relu_axiom");
-    solver.assert(pos_relu_axiom._eq(0.0))?;
-    for var in input_vars {
-        solver.assert(var.ge(pos_relu_axiom).ite(var._eq(*var), var._eq(0.0)))?;
+    variables: &Vec<&Vec<SExpr>>,
+    var_rows: usize,
+    var_cols: usize,
+    mut ctx: Context,
+    sort: SExpr,
+    name: &str,
+) -> anyhow::Result<(Vec<Vec<SExpr>>, Context)> {
+    let mut const_rows = vec![];
+    for i in 0..var_rows {
+        let mut row = vec![];
+        for j in 0..var_cols {
+            let aux_var = ctx
+                .declare_const(format!("{}{}_{}", name, i, j).as_str(), sort)
+                .map_err(|e| anyhow!("Issue declaring linear constraint const"))?;
+            let relu = ctx.ite(
+                ctx.gte(variables[i][j], ctx.decimal(0.0)),
+                variables[i][j],
+                ctx.decimal(0.0),
+            );
+            ctx.assert(ctx.eq(aux_var, relu))?;
+            row.push(aux_var);
+        }
+        const_rows.push(row);
     }
-    Ok(solver)
+    Ok((const_rows, ctx))
 }
 
-// We are approximating the softmax with a >= 0 and sum(a) = 1.0 constraint
+// We may try approximating the softmax with a >= 0 and sum(a) = 1.0 constraint
 fn generate_q_k_dot_product_constraints_with_axioms(
     q_vars: &Vec<Vec<SExpr>>, // we transpose Q in our case -> we need to swap indices
     k_vars: &Vec<Vec<SExpr>>,
@@ -161,6 +172,30 @@ fn generate_qkv_constraints(
         const_rows.push(row);
     }
 
+    Ok((const_rows, ctx))
+}
+
+fn residual_connection_constraints(
+    emb_vars: &Vec<Vec<SExpr>>,
+    qkv_vars: &Vec<Vec<SExpr>>,
+    dim_k: usize,
+    seq_len: usize,
+    mut ctx: Context,
+    sort: SExpr,
+) -> anyhow::Result<(Vec<Vec<SExpr>>, Context)> {
+    let mut const_rows = vec![];
+    for i in 0..dim_k {
+        let mut row = vec![];
+        for j in 0..seq_len {
+            let aux_var = ctx
+                .declare_const(format!("res{}_{}", i, j).as_str(), sort)
+                .map_err(|e| anyhow!("Issue declaring linear constraint const"))?;
+            let result = ctx.plus(emb_vars[i][j], qkv_vars[i][j]);
+            ctx.assert(ctx.eq(aux_var, result))?;
+            row.push(aux_var);
+        }
+        const_rows.push(row);
+    }
     Ok((const_rows, ctx))
 }
 
@@ -260,11 +295,73 @@ pub fn verify_transformer_block<'a>(
     println!("QK rows: {}", qk_constraints.len());
     println!("QK cols: {}", qk_constraints[0].len());
 
-    let (qkv_constraints, mut ctx) =
+    let (qkv_constraints, ctx) =
         generate_qkv_constraints(&v_constraints, &qk_constraints, d_model, seq_len, ctx, real)?;
 
     println!("QKV rows: {}", qkv_constraints.len());
     println!("QKV cols: {}", qkv_constraints[0].len());
+
+    let (res_constraints, ctx) = residual_connection_constraints(
+        &emb_constraints,
+        &qkv_constraints,
+        d_model,
+        seq_len,
+        ctx,
+        real,
+    )?;
+
+    println!("Res rows: {}", res_constraints.len());
+    println!("Res cols: {}", res_constraints[0].len());
+
+    let (w1_constraints, ctx) = generate_linear_constraints(
+        w1,
+        hidden_dim,
+        d_model * seq_len,
+        Some(b1),
+        &res_constraints
+            .iter()
+            .flatten()
+            .map(|constraint| vec![*constraint])
+            .collect::<Vec<Vec<SExpr>>>()
+            .iter()
+            .collect(), // we unroll the matrix into a vector
+        d_model * seq_len,
+        1,
+        ctx,
+        real,
+        "w1_",
+    )?;
+
+    println!("W1 rows: {}", w1_constraints.len());
+    println!("W1 cols: {}", w1_constraints[0].len());
+
+    let (relu_constraints, ctx) = generate_relu_constraints(
+        &w1_constraints.iter().collect(),
+        hidden_dim,
+        1,
+        ctx,
+        real,
+        "w1_relu_",
+    )?;
+
+    println!("ReLU rows: {}", relu_constraints.len());
+    println!("ReLU cols: {}", relu_constraints[0].len());
+
+    let (w2_constraints, mut ctx) = generate_linear_constraints(
+        w2,
+        1, // output dim is 1
+        hidden_dim,
+        Some(b2),
+        &relu_constraints.iter().collect(),
+        hidden_dim,
+        1,
+        ctx,
+        real,
+        "w2_",
+    )?;
+
+    println!("W2 rows: {}", w2_constraints.len());
+    println!("W2 cols: {}", w2_constraints[0].len());
 
     let check_result = ctx.check();
 
@@ -300,6 +397,26 @@ pub fn verify_transformer_block<'a>(
     }
 
     let solution = ctx.get_value(qkv_constraints.into_iter().flatten().collect())?; // qk_constraints.into_iter().flatten().collect()
+    for (variable, value) in solution {
+        println!("{} = {}", ctx.display(variable), ctx.display(value));
+    }
+
+    let solution = ctx.get_value(res_constraints.into_iter().flatten().collect())?; // qk_constraints.into_iter().flatten().collect()
+    for (variable, value) in solution {
+        println!("{} = {}", ctx.display(variable), ctx.display(value));
+    }
+
+    let solution = ctx.get_value(w1_constraints.into_iter().flatten().collect())?; // qk_constraints.into_iter().flatten().collect()
+    for (variable, value) in solution {
+        println!("{} = {}", ctx.display(variable), ctx.display(value));
+    }
+
+    let solution = ctx.get_value(relu_constraints.into_iter().flatten().collect())?; // qk_constraints.into_iter().flatten().collect()
+    for (variable, value) in solution {
+        println!("{} = {}", ctx.display(variable), ctx.display(value));
+    }
+
+    let solution = ctx.get_value(w2_constraints.into_iter().flatten().collect())?; // qk_constraints.into_iter().flatten().collect()
     for (variable, value) in solution {
         println!("{} = {}", ctx.display(variable), ctx.display(value));
     }
