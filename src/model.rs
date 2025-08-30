@@ -45,8 +45,34 @@ pub fn linear_no_bias(in_dim: usize, out_dim: usize, vb: VarBuilder) -> anyhow::
 
 impl Module for Linear {
     fn forward(&self, xs: &Tensor) -> candle_core::Result<Tensor> {
-        let w = self.weight.t()?;
-        let x = xs.matmul(&w)?; // we are handling only the simples 2D case here
+        let x = match *xs.dims() {
+            [b1, b2, m, k] => {
+                if xs.is_contiguous() {
+                    let w = self.weight.t()?;
+                    xs.reshape((b1 * b2 * m, k))?
+                        .matmul(&w)?
+                        .reshape((b1, b2, m, ()))?
+                } else {
+                    let w = self.weight.broadcast_left((b1, b2))?.t()?;
+                    xs.matmul(&w)?
+                }
+            }
+            [bsize, m, k] => {
+                if xs.is_contiguous() {
+                    let w = self.weight.t()?;
+                    xs.reshape((bsize * m, k))?
+                        .matmul(&w)?
+                        .reshape((bsize, m, ()))?
+                } else {
+                    let w = self.weight.broadcast_left(bsize)?.t()?;
+                    xs.matmul(&w)?
+                }
+            }
+            _ => {
+                let w = self.weight.t()?;
+                xs.matmul(&w)?
+            }
+        };
         match &self.bias {
             None => Ok(x),
             Some(bias) => x.broadcast_add(bias),
@@ -122,6 +148,9 @@ impl Module for NaiveMLP {
 
 // A naive Transformer block with a single attention head and a simple MLP
 pub struct NaiveTransformerBlock {
+    d_model: usize,
+    seq_len: usize,
+    emb: Linear,
     attn: NaiveAttentionHead,
     mlp: NaiveMLP,
 }
@@ -129,20 +158,30 @@ pub struct NaiveTransformerBlock {
 impl NaiveTransformerBlock {
     fn new(
         in_dim: usize,
+        seq_len: usize,
+        d_model: usize,
         hidden_dim: usize,
         out_dim: usize,
         vb: VarBuilder,
     ) -> anyhow::Result<Self> {
-        let attn = NaiveAttentionHead::new(in_dim, in_dim, vb.pp("attn"))?; // Notice that since we are using a single head, hidden_dim = in_dim
-        let mlp = NaiveMLP::new(in_dim, hidden_dim, out_dim, vb.pp("mlp"))?;
-        Ok(Self { attn, mlp })
+        let emb = linear_no_bias(in_dim, d_model, vb.pp("emb"))?; // input embedding layer
+        let attn = NaiveAttentionHead::new(d_model, d_model, vb.pp("attn"))?; // d_model = d_k
+        let mlp = NaiveMLP::new(d_model * seq_len, hidden_dim, out_dim, vb.pp("mlp"))?;
+        Ok(Self {
+            d_model,
+            seq_len,
+            emb,
+            attn,
+            mlp,
+        })
     }
 }
 
 impl Module for NaiveTransformerBlock {
     fn forward(&self, xs: &Tensor) -> candle_core::Result<Tensor> {
-        let attn_out = self.attn.forward(xs)?; // attention output
-        let attn_res = (xs + attn_out)?; // residual connection
+        let emb = self.emb.forward(xs)?; // input embedding
+        let attn_out = self.attn.forward(&emb)?; // attention output
+        let attn_res = (emb + attn_out)?.reshape(((), self.d_model * self.seq_len))?; // residual connection
         self.mlp.forward(&attn_res) // Notice the oversimplification here: no residual connection after MLP
     }
 }
@@ -150,6 +189,8 @@ impl Module for NaiveTransformerBlock {
 // Note the MSE loss instead of Cross-Entropy which would make more sense for a classification task, but the former plays better with linear SMT
 pub fn train_transformer<'a>(
     in_dim: usize,
+    seq_len: usize,
+    d_model: usize,
     hidden_dim: usize,
     out_dim: usize,
     xs: Tensor,
@@ -160,8 +201,14 @@ pub fn train_transformer<'a>(
     let varmap = VarMap::new();
     let vs = VarBuilder::from_varmap(&varmap, DType::F32, &device);
 
-    let transformer_block =
-        NaiveTransformerBlock::new(in_dim, hidden_dim, out_dim, vs.pp("transformer"))?;
+    let transformer_block = NaiveTransformerBlock::new(
+        in_dim,
+        seq_len,
+        d_model,
+        hidden_dim,
+        out_dim,
+        vs.pp("transformer"),
+    )?;
 
     let mut adam_params = ParamsAdamW::default();
     adam_params.lr = 0.01;
@@ -181,4 +228,72 @@ pub fn train_transformer<'a>(
     }
 
     Ok(vs)
+}
+
+pub fn get_trained_weights(
+    vs: &VarBuilder,
+    in_dim: usize,
+    seq_len: usize,
+    d_model: usize,
+    hidden_dim: usize,
+    out_dim: usize,
+) -> anyhow::Result<(
+    Vec<Vec<f64>>,
+    Vec<Vec<f64>>,
+    Vec<Vec<f64>>,
+    Vec<Vec<f64>>,
+    Vec<Vec<f64>>,
+    Vec<f64>,
+    Vec<Vec<f64>>,
+    Vec<f64>,
+)> {
+    let weights_emb = vs
+        .get((d_model, in_dim), "transformer.emb.weight")?
+        .to_vec2::<f32>()?
+        .into_iter()
+        .map(|vec| vec.into_iter().map(|x| x as f64).collect())
+        .collect();
+    let weights_q = vs
+        .get((d_model, d_model), "transformer.attn.query.weight")?
+        .to_vec2::<f32>()?
+        .into_iter()
+        .map(|vec| vec.into_iter().map(|x| x as f64).collect())
+        .collect();
+    let weights_k = vs
+        .get((d_model, d_model), "transformer.attn.key.weight")?
+        .to_vec2::<f32>()?
+        .into_iter()
+        .map(|vec| vec.into_iter().map(|x| x as f64).collect())
+        .collect();
+    let weights_v = vs
+        .get((d_model, d_model), "transformer.attn.value.weight")?
+        .to_vec2::<f32>()?
+        .into_iter()
+        .map(|vec| vec.into_iter().map(|x| x as f64).collect())
+        .collect();
+    let w1 = vs
+        .get((hidden_dim, d_model * seq_len), "transformer.mlp.w1.weight")?
+        .to_vec2::<f32>()?
+        .into_iter()
+        .map(|vec| vec.into_iter().map(|x| x as f64).collect())
+        .collect();
+    let b1 = vs
+        .get(hidden_dim, "transformer.mlp.w1.bias")?
+        .to_vec1::<f32>()?
+        .into_iter()
+        .map(|x| x as f64)
+        .collect();
+    let w2 = vs
+        .get((out_dim, hidden_dim), "transformer.mlp.w2.weight")?
+        .to_vec2::<f32>()?
+        .into_iter()
+        .map(|vec| vec.into_iter().map(|x| x as f64).collect())
+        .collect();
+    let b2 = vs
+        .get(out_dim, "transformer.mlp.w2.bias")?
+        .to_vec1::<f32>()?
+        .into_iter()
+        .map(|x| x as f64)
+        .collect();
+    Ok((weights_emb, weights_q, weights_k, weights_v, w1, b1, w2, b2))
 }

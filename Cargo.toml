@@ -12,3 +12,4 @@ candle-nn = { git = "https://github.com/huggingface/candle.git", version = "0.9"
 ] }
 anyhow = "1.0"
 smtlib = { version = "0.3.0" }
+easy-smt = "0.3.2"
