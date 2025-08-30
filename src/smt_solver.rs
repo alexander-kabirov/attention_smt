@@ -1,5 +1,5 @@
 use anyhow::anyhow;
-use easy_smt::{Context, ContextBuilder, SExpr};
+use easy_smt::{Context, ContextBuilder, Response, SExpr};
 
 // Generates n Real variables and adds them to the context, we also enforce them to be boolean (0.0 or 1.0)
 // If non_zero is true, we enforce at least one variable to be non-zero
@@ -234,9 +234,6 @@ pub fn verify_transformer_block<'a>(
         "emb_",
     )?;
 
-    println!("Emb rows: {}", emb_constraints.len());
-    println!("Emb cols: {}", emb_constraints[0].len());
-
     let (q_constraints, ctx) = generate_linear_constraints(
         weights_q,
         d_model,
@@ -249,8 +246,6 @@ pub fn verify_transformer_block<'a>(
         real,
         "q_",
     )?;
-    println!("Q rows: {}", q_constraints.len());
-    println!("Q cols: {}", q_constraints[0].len());
 
     let (k_constraints, ctx) = generate_linear_constraints(
         weights_k,
@@ -264,8 +259,6 @@ pub fn verify_transformer_block<'a>(
         real,
         "k_",
     )?;
-    println!("K rows: {}", k_constraints.len());
-    println!("K cols: {}", k_constraints[0].len());
 
     let (v_constraints, mut ctx) = generate_linear_constraints(
         weights_v,
@@ -280,9 +273,6 @@ pub fn verify_transformer_block<'a>(
         "v_",
     )?;
 
-    println!("V rows: {}", v_constraints.len());
-    println!("V cols: {}", v_constraints[0].len());
-
     let (qk_constraints, ctx) = generate_q_k_dot_product_constraints_with_axioms(
         &q_constraints,
         &k_constraints,
@@ -292,14 +282,8 @@ pub fn verify_transformer_block<'a>(
         real,
     )?;
 
-    println!("QK rows: {}", qk_constraints.len());
-    println!("QK cols: {}", qk_constraints[0].len());
-
     let (qkv_constraints, ctx) =
         generate_qkv_constraints(&v_constraints, &qk_constraints, d_model, seq_len, ctx, real)?;
-
-    println!("QKV rows: {}", qkv_constraints.len());
-    println!("QKV cols: {}", qkv_constraints[0].len());
 
     let (res_constraints, ctx) = residual_connection_constraints(
         &emb_constraints,
@@ -309,9 +293,6 @@ pub fn verify_transformer_block<'a>(
         ctx,
         real,
     )?;
-
-    println!("Res rows: {}", res_constraints.len());
-    println!("Res cols: {}", res_constraints[0].len());
 
     let (w1_constraints, ctx) = generate_linear_constraints(
         w1,
@@ -332,9 +313,6 @@ pub fn verify_transformer_block<'a>(
         "w1_",
     )?;
 
-    println!("W1 rows: {}", w1_constraints.len());
-    println!("W1 cols: {}", w1_constraints[0].len());
-
     let (relu_constraints, ctx) = generate_relu_constraints(
         &w1_constraints.iter().collect(),
         hidden_dim,
@@ -343,9 +321,6 @@ pub fn verify_transformer_block<'a>(
         real,
         "w1_relu_",
     )?;
-
-    println!("ReLU rows: {}", relu_constraints.len());
-    println!("ReLU cols: {}", relu_constraints[0].len());
 
     let (w2_constraints, mut ctx) = generate_linear_constraints(
         w2,
@@ -360,90 +335,58 @@ pub fn verify_transformer_block<'a>(
         "w2_",
     )?;
 
-    println!("W2 rows: {}", w2_constraints.len());
-    println!("W2 cols: {}", w2_constraints[0].len());
+    // Add sample assertions:
+    // 1. Counterfactuals: An input that should produce 1 outputs a 0 and vice versa (threshold-based)
+    // GOAL: we need to see an UNSAT result (i.e., no counterexample exists)
+    // Different training runs to provide different results, if we found some counterexamples we show them
+    // Next we could add those counterexamples as additional constraints to get more examples
+    // We can verify the attention patterns too in a similar way
+
+    let boolean = ctx.bool_sort();
+    let x0_bool = ctx.declare_const("x0_bool", boolean)?;
+    ctx.assert(ctx.eq(x0_bool, ctx.eq(variables[0], ctx.decimal(1.0))))?;
+    let x2_bool = ctx.declare_const("x2_bool", boolean)?;
+    ctx.assert(ctx.eq(x2_bool, ctx.eq(variables[2], ctx.decimal(1.0))))?;
+    let x4_bool = ctx.declare_const("x4_bool", boolean)?;
+    ctx.assert(ctx.eq(x4_bool, ctx.eq(variables[4], ctx.decimal(1.0))))?;
+    ctx.assert(ctx.or(
+        ctx.and(
+            ctx.eq(ctx.xor(ctx.xor(x0_bool, x2_bool), x4_bool), ctx.true_()),
+            ctx.lt(w2_constraints[0][0], ctx.decimal(0.0)),
+        ),
+        ctx.and(
+            ctx.eq(ctx.xor(ctx.xor(x0_bool, x2_bool), x4_bool), ctx.false_()),
+            ctx.gt(w2_constraints[0][0], ctx.decimal(0.0)),
+        ),
+    ))?;
 
     let check_result = ctx.check();
 
-    println!("Check result: {:?}", check_result);
+    match check_result {
+        Ok(result) => match result {
+            Response::Sat => {
+                println!("SAT, Here is a counterexample:");
+                let solution = ctx.get_value(variables)?;
+                for (variable, value) in solution {
+                    println!("{} = {}", ctx.display(variable), ctx.display(value));
+                }
 
-    // Check whether the assertions are satisfiable. They should be in this example.
-    //assert_eq!(ctx.check()?, Response::Sat);
-
-    // Print the solution!
-    let solution = ctx.get_value(variables)?;
-    for (variable, value) in solution {
-        println!("{} = {}", ctx.display(variable), ctx.display(value));
+                let solution = ctx.get_value(vec![w2_constraints[0][0]])?;
+                for (variable, value) in solution {
+                    println!("{} = {}", ctx.display(variable), ctx.display(value));
+                }
+            }
+            Response::Unsat => {
+                println!("UNSAT (No counterexamples exists)");
+            }
+            Response::Unknown => {
+                println!("UNKNOWN result from SMT solver");
+            }
+        },
+        Err(e) => {
+            println!("Error during check: {}", e);
+            return Err(anyhow!("Error during SMT check"));
+        }
     }
-    let solution = ctx.get_value(emb_constraints.into_iter().flatten().collect())?;
-    for (variable, value) in solution {
-        println!("{} = {}", ctx.display(variable), ctx.display(value));
-    }
-    let solution = ctx.get_value(q_constraints.into_iter().flatten().collect())?;
-    for (variable, value) in solution {
-        println!("{} = {}", ctx.display(variable), ctx.display(value));
-    }
-    let solution = ctx.get_value(k_constraints.into_iter().flatten().collect())?;
-    for (variable, value) in solution {
-        println!("{} = {}", ctx.display(variable), ctx.display(value));
-    }
-    let solution = ctx.get_value(v_constraints.into_iter().flatten().collect())?;
-    for (variable, value) in solution {
-        println!("{} = {}", ctx.display(variable), ctx.display(value));
-    }
-    let solution = ctx.get_value(qk_constraints.into_iter().flatten().collect())?; // qk_constraints.into_iter().flatten().collect()
-    for (variable, value) in solution {
-        println!("{} = {}", ctx.display(variable), ctx.display(value));
-    }
-
-    let solution = ctx.get_value(qkv_constraints.into_iter().flatten().collect())?; // qk_constraints.into_iter().flatten().collect()
-    for (variable, value) in solution {
-        println!("{} = {}", ctx.display(variable), ctx.display(value));
-    }
-
-    let solution = ctx.get_value(res_constraints.into_iter().flatten().collect())?; // qk_constraints.into_iter().flatten().collect()
-    for (variable, value) in solution {
-        println!("{} = {}", ctx.display(variable), ctx.display(value));
-    }
-
-    let solution = ctx.get_value(w1_constraints.into_iter().flatten().collect())?; // qk_constraints.into_iter().flatten().collect()
-    for (variable, value) in solution {
-        println!("{} = {}", ctx.display(variable), ctx.display(value));
-    }
-
-    let solution = ctx.get_value(relu_constraints.into_iter().flatten().collect())?; // qk_constraints.into_iter().flatten().collect()
-    for (variable, value) in solution {
-        println!("{} = {}", ctx.display(variable), ctx.display(value));
-    }
-
-    let solution = ctx.get_value(w2_constraints.into_iter().flatten().collect())?; // qk_constraints.into_iter().flatten().collect()
-    for (variable, value) in solution {
-        println!("{} = {}", ctx.display(variable), ctx.display(value));
-    }
-
-    // let (q_constraints, mut ctx) =
-    //     generate_linear_constraints(&variables, weights_q, None, ctx, real, "q_")?;
-
-    // let (k_constraints, ctx) =
-    //     generate_linear_constraints(&variables, weights_k, None, ctx, real, "k_")?;
-    // let (v_constraints, ctx) =
-    //     generate_linear_constraints(&variables, weights_v, None, ctx, real, "v_")?;
-    //
-    // let (qk_constraints, mut ctx) = generate_q_k_dot_product_constraints_with_axioms(
-    //     &q_constraints,
-    //     &k_constraints,
-    //     ctx,
-    //     real,
-    // )?;
-
-    // let (qkv_constraints, solver) =
-    //     generate_qkv_constraints(&qk_constraints, &v_constraints, &st, solver)?;
-    //
-    // let (w1_constraints, solver) =
-    //     generate_linear_constraints(&qkv_constraints, w1, Some(b1), &st, solver, "w1_")?;
-    // let solver = generate_relu_constraints(&w1_constraints, &st, solver)?;
-    // let (w2_constraints, solver) =
-    //     generate_linear_constraints(&w1_constraints, w2, Some(b2), &st, solver, "w2_")?;
-
     Ok(())
 }

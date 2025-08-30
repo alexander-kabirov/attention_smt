@@ -1,6 +1,7 @@
 use candle_core::{DType, Device, Module, Tensor};
 use candle_nn::init::DEFAULT_KAIMING_NORMAL;
 use candle_nn::loss::mse;
+use candle_nn::ops::sigmoid;
 use candle_nn::{ops, Init, Optimizer, ParamsAdamW, VarBuilder, VarMap};
 
 // A simple Linear layer implementation
@@ -215,7 +216,7 @@ pub fn train_transformer<'a>(
     let mut optimizer = candle_nn::AdamW::new(varmap.all_vars(), adam_params)?;
 
     for epoch in 0..epochs {
-        let pred = transformer_block.forward(&xs)?;
+        let pred = sigmoid(&transformer_block.forward(&xs)?)?; // The idea here is to mode 0 prediction to negative and 1 to positive so we can apply 0.0 threshold in SMT
 
         let loss = mse(&pred, &ys)?;
 

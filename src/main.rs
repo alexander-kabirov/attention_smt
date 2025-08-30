@@ -49,8 +49,6 @@ fn main() -> anyhow::Result<()> {
     let (weights_emb, weights_q, weights_k, weights_v, w1, b1, w2, b2) =
         get_trained_weights(&trained_vs, in_dim, seq_len, d_model, hidden_dim, out_dim)?;
 
-    println!("Weights emb: {:?}", weights_emb);
-
     // Solving with SMT
     println!("Verifying the trained transformer block with SMT...");
     verify_transformer_block(
